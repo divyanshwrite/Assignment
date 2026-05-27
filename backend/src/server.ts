@@ -12,6 +12,7 @@ import { createRedisClient, EVENT_CHANNEL } from "./db/redis.js";
 import assignmentsRouter from "./routes/assignments.js";
 import shareRouter from "./routes/share.js";
 import type { AssignmentEvent } from "./types/assessment.js";
+import { startWorkers } from "./worker.js";
 
 const corsOptions: CorsOptions = {
   origin(origin, callback) {
@@ -78,6 +79,12 @@ io.on("connection", (socket) => {
 
 await connectMongo();
 
+// Boot BullMQ workers in the same process.
+// On Render's free tier this avoids needing a separate worker service.
+// Set RUN_WORKERS=false to disable when running a dedicated worker elsewhere.
+const runWorkers = (process.env.RUN_WORKERS ?? "true").toLowerCase() !== "false";
+const workerHandles = runWorkers ? startWorkers() : null;
+
 const subscriber = createRedisClient();
 await subscriber.subscribe(EVENT_CHANNEL);
 subscriber.on("message", (_channel: string, raw: string) => {
@@ -97,6 +104,9 @@ async function shutdown(signal: string) {
   console.log(`${signal} received. Shutting down API server...`);
   server.close(async () => {
     await subscriber.quit();
+    if (workerHandles) {
+      await workerHandles.close();
+    }
     await disconnectMongo();
     process.exit(0);
   });

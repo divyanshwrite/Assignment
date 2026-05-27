@@ -1,4 +1,6 @@
+import http from "node:http";
 import { Worker, type Job } from "bullmq";
+import { env } from "./config/env.js";
 import { connectMongo, disconnectMongo } from "./db/mongo.js";
 import { createQueueConnection } from "./db/redis.js";
 import { Assignment } from "./models/Assignment.js";
@@ -9,19 +11,88 @@ import { renderQuestionPaperPdf } from "./services/pdf.js";
 import { buildGenerationPrompt } from "./services/promptBuilder.js";
 import type { AssignmentInput } from "./types/assessment.js";
 
-await connectMongo();
+export interface WorkerHandles {
+  generationWorker: Worker;
+  pdfWorker: Worker;
+  close: () => Promise<void>;
+}
 
-// ─── Generation worker ────────────────────────────────────────────────────────
-const generationWorker = new Worker(
-  generationQueueName,
-  async (job) => {
-    if (job.name === "regenerate-question") {
-      return handleRegenerateQuestion(job.data.assignmentId, job.data.questionId);
+export function startWorkers(): WorkerHandles {
+  const generationWorker = new Worker(
+    generationQueueName,
+    async (job) => {
+      if (job.name === "regenerate-question") {
+        return handleRegenerateQuestion(job.data.assignmentId, job.data.questionId);
+      }
+      return handleFullGeneration(job);
+    },
+    { connection: createQueueConnection() as any, concurrency: 2 }
+  );
+
+  const pdfWorker = new Worker(
+    pdfQueueName,
+    async (job) => {
+      const assignment = await Assignment.findById(job.data.assignmentId);
+      if (!assignment?.result) {
+        throw new Error("Generated paper is not available.");
+      }
+
+      const buffer = await renderQuestionPaperPdf(assignment.result);
+      assignment.pdf = {
+        data: buffer,
+        contentType: "application/pdf",
+        generatedAt: new Date()
+      };
+      await assignment.save();
+
+      await saveJobState({
+        assignmentId: assignment.id,
+        status: "pdf-ready",
+        progress: 100,
+        message: "PDF export is ready."
+      });
+
+      return { assignmentId: assignment.id };
+    },
+    { connection: createQueueConnection() as any, concurrency: 1 }
+  );
+
+  generationWorker.on("failed", async (job, error) => {
+    const assignmentId = String(job?.data.assignmentId || "");
+    if (!assignmentId) {
+      return;
     }
-    return handleFullGeneration(job);
-  },
-  { connection: createQueueConnection() as any, concurrency: 2 }
-);
+    if (job?.name === "regenerate-question") {
+      await saveJobState({
+        assignmentId,
+        status: "completed",
+        progress: 100,
+        message: `Question regeneration failed: ${error.message}`
+      });
+      return;
+    }
+    await Assignment.findByIdAndUpdate(assignmentId, {
+      status: "failed",
+      error: error.message
+    });
+    await saveJobState({
+      assignmentId,
+      status: "failed",
+      progress: 100,
+      message: error.message
+    });
+  });
+
+  console.log("VedaAI workers are running.");
+
+  return {
+    generationWorker,
+    pdfWorker,
+    async close() {
+      await Promise.all([generationWorker.close(), pdfWorker.close()]);
+    }
+  };
+}
 
 async function handleFullGeneration(job: Job) {
   const assignment = await Assignment.findById(job.data.assignmentId);
@@ -70,11 +141,13 @@ async function handleFullGeneration(job: Job) {
 
   console.log(
     `[worker] Generated paper ${assignment.id} with`,
-    paper.sections.flatMap((s) =>
-      s.questions
-        .filter((q) => q.type === "multiple-choice")
-        .map((q) => `${q.id}:${q.options?.length ?? 0} opts`)
-    ).join(", ") || "(no MCQs)"
+    paper.sections
+      .flatMap((s) =>
+        s.questions
+          .filter((q) => q.type === "multiple-choice")
+          .map((q) => `${q.id}:${q.options?.length ?? 0} opts`)
+      )
+      .join(", ") || "(no MCQs)"
   );
 
   assignment.result = paper;
@@ -183,9 +256,10 @@ function enforceMcqIntegrity(paper: { sections: { questions: any[] }[] }) {
       const existing = (question.options ?? [])
         .map((opt: string) => (opt ?? "").trim())
         .filter(Boolean);
-      const merged = existing.length >= 4
-        ? existing.slice(0, 4)
-        : [...existing, ...fallback.slice(existing.length)].slice(0, 4);
+      const merged =
+        existing.length >= 4
+          ? existing.slice(0, 4)
+          : [...existing, ...fallback.slice(existing.length)].slice(0, 4);
       question.options = merged.map((opt: string, idx: number) => {
         const stripped = opt.replace(/^\s*[A-Da-d][\.\)\:\-]\s*/, "").trim();
         return `${letters[idx]}. ${stripped || `Option ${letters[idx]}`}`;
@@ -199,75 +273,37 @@ function enforceMcqIntegrity(paper: { sections: { questions: any[] }[] }) {
   }
 }
 
-// ─── PDF worker ───────────────────────────────────────────────────────────────
-const pdfWorker = new Worker(
-  pdfQueueName,
-  async (job) => {
-    const assignment = await Assignment.findById(job.data.assignmentId);
-    if (!assignment?.result) {
-      throw new Error("Generated paper is not available.");
-    }
+// ─── Standalone entrypoint ────────────────────────────────────────────────────
+// Only run as standalone if this file is the process entry (not imported).
+const isStandalone =
+  import.meta.url === `file://${process.argv[1]?.replace(/\\/g, "/")}` ||
+  import.meta.url === new URL(`file://${process.argv[1]}`).href;
 
-    const buffer = await renderQuestionPaperPdf(assignment.result);
-    assignment.pdf = {
-      data: buffer,
-      contentType: "application/pdf",
-      generatedAt: new Date()
-    };
-    await assignment.save();
+if (isStandalone) {
+  await connectMongo();
+  const handles = startWorkers();
 
-    await saveJobState({
-      assignmentId: assignment.id,
-      status: "pdf-ready",
-      progress: 100,
-      message: "PDF export is ready."
+  const healthPort = Number(process.env.PORT) || env.PORT;
+  http
+    .createServer((_req, res) => {
+      res.writeHead(200, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ ok: true, service: "vedaai-worker" }));
+    })
+    .listen(healthPort, () => {
+      console.log(`Worker health endpoint on http://localhost:${healthPort}`);
     });
 
-    return { assignmentId: assignment.id };
-  },
-  { connection: createQueueConnection() as any, concurrency: 1 }
-);
+  const shutdown = async (signal: string) => {
+    console.log(`${signal} received. Shutting down workers...`);
+    await handles.close();
+    await disconnectMongo();
+    process.exit(0);
+  };
 
-generationWorker.on("failed", async (job, error) => {
-  const assignmentId = String(job?.data.assignmentId || "");
-  if (!assignmentId) {
-    return;
-  }
-  // For single-question regen failures we don't want to mark the whole assignment failed.
-  if (job?.name === "regenerate-question") {
-    await saveJobState({
-      assignmentId,
-      status: "completed",
-      progress: 100,
-      message: `Question regeneration failed: ${error.message}`
-    });
-    return;
-  }
-  await Assignment.findByIdAndUpdate(assignmentId, {
-    status: "failed",
-    error: error.message
+  process.on("SIGINT", () => {
+    void shutdown("SIGINT");
   });
-  await saveJobState({
-    assignmentId,
-    status: "failed",
-    progress: 100,
-    message: error.message
+  process.on("SIGTERM", () => {
+    void shutdown("SIGTERM");
   });
-});
-
-console.log("VedaAI workers are running.");
-
-async function shutdown(signal: string) {
-  console.log(`${signal} received. Shutting down workers...`);
-  await Promise.all([generationWorker.close(), pdfWorker.close()]);
-  await disconnectMongo();
-  process.exit(0);
 }
-
-process.on("SIGINT", () => {
-  void shutdown("SIGINT");
-});
-
-process.on("SIGTERM", () => {
-  void shutdown("SIGTERM");
-});
